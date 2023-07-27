@@ -1,0 +1,309 @@
+1. Download zone files (LOCAL)
+
+2. Parse all zone files for domains (LOCAL)(21 minutes)
+
+./zoneparse.pl com.zone com originalhost.txt
+./zoneparse.pl net.zone net originalhost.txt
+./zoneparse.pl org.zone org originalhost.txt
+./zoneparse.pl info.zone info originalhost.txt
+./zoneparse2.pl us.zone us originalhost.txt
+./zoneparse2.pl biz.zone biz originalhost.txt
+
+
+
+3. Parse all zone files for nameservers (LOCAL)(3 mins)
+
+./Azoneparse.pl com.zone COM nameserver.txt
+./Azoneparse.pl net.zone NET nameserver.txt
+./Azoneparse.pl org.zone ORG nameserver.txt
+./Azoneparse.pl info.zone INFO nameserver.txt
+./Azoneparse2.pl us.zone US nameserver.txt
+./Azoneparse2.pl biz.zone BIZ nameserver.txt
+
+4. Cut originalhost.txt in to 10 chunks
+
+wc -l originalhost.txt
+96800272 originalhost.txt
+split -l 9700000 originalhost.txt 
+
+source rename_split.sh
+	mv xaa machine1.originalhost.txt
+	mv xab machine2.originalhost.txt
+	mv xac machine3.originalhost.txt
+	mv xad machine4.originalhost.txt
+	mv xae machine5.originalhost.txt
+	mv xaf machine6.originalhost.txt
+	mv xag machine7.originalhost.txt
+	mv xah machine8.originalhost.txt
+	mv xai machine9.originalhost.txt
+	mv xaj machine10.originalhost.txt
+
+gzip machine*.txt
+gzip nameserver.txt
+
+5. upload to s3
+
+ripmachines/
+
+8. Start 10 VMs (LOCAL)
+for i in `seq 1 10`;do ec2-run-instances ami-9527c2fc -k gsg-keypair;done
+
+to find IPs and match to listed hosts:
+wget -qO - http://myip.dk/ | egrep -m1 -o '[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}'
+
+export MACHINE=machine1
+export MACHINE=machine2
+export MACHINE=machine3
+export MACHINE=machine4
+export MACHINE=machine5
+export MACHINE=machine6
+export MACHINE=machine7
+export MACHINE=machine8
+export MACHINE=machine9
+export MACHINE=machine10
+
+source startup.sh;/etc/init.d/mysql restart;mkdir -p /mnt/qd/results;chmod -R 777 /mnt/qd
+
+setup directories and create revip db
+
+9. download machineX.originalhost.txt.gz and nameserver.txt.gz and unzip
+
+cd /mnt/revip/;s3get ripmachines/$MACHINE.originalhost.txt.gz originalhost.txt.gz;s3get ripmachines/nameserver.txt.gz nameserver.txt.gz;gunzip *.gz
+
+===restore missing====
+cd /mnt/revip/;s3get ripresults/missing.$MACHINE.txt.gz missing.txt.gz;s3get ripmachines/nameserver.txt.gz nameserver.txt.gz;gunzip *.gz
+======================
+
+10. Insert hosts and nameservers into database (REMOTE) (5 mins)
+mysql -u root -ptest
+USE revip;
+CREATE TABLE `originalhost` (
+  `id` INT UNSIGNED NOT NULL auto_increment,
+  `domain` varchar(64) default NULL,
+  `tld` varchar(4) default NULL,
+  `nameserver` varchar(255) default NULL,
+  PRIMARY KEY  (`id`),
+  KEY `nameserver` (`nameserver`)
+) ENGINE=MyISAM AUTO_INCREMENT=1 DEFAULT CHARSET=latin1;
+
+CREATE TABLE `nameserver` (
+  `id` int(11) NOT NULL auto_increment,
+  `hostname` varchar(255) default NULL,
+  `ip` varchar(20) default NULL,
+  PRIMARY KEY  (`id`),
+  KEY `hostname` (`hostname`)
+) ENGINE=MyISAM AUTO_INCREMENT=1 DEFAULT CHARSET=latin1;
+
+ALTER TABLE originalhost DISABLE KEYS;
+LOAD DATA INFILE '/mnt/revip/originalhost.txt' INTO TABLE originalhost FIELDS TERMINATED BY ',' (domain,tld,nameserver);
+ALTER TABLE originalhost ENABLE KEYS;
+
+LOAD DATA INFILE '/mnt/revip/nameserver.txt' INTO TABLE nameserver FIELDS TERMINATED BY ',' (hostname,ip);
+ALTER TABLE nameserver ENABLE KEYS;
+
+11. Insert into host table (REMOTE) (20 mins)
+
+CREATE TABLE `host` (
+  `id` INT UNSIGNED NOT NULL auto_increment,
+  `domain` VARCHAR(64) default NULL,
+  `tld` VARCHAR(4) default NULL,
+  `nsip` BIGINT default NULL,
+  PRIMARY KEY  (`id`),
+  KEY `domain` (`domain`),
+  KEY `tld` (`tld`)
+) ENGINE=MyISAM AUTO_INCREMENT=1 DEFAULT CHARSET=latin1;
+
+ALTER TABLE host DISABLE KEYS;
+INSERT INTO host(domain,tld,nsip) SELECT h.domain, h.tld, INET_ATON(ns.ip) FROM originalhost h LEFT JOIN nameserver ns on h.nameserver = ns.hostname;
+ALTER TABLE host ENABLE KEYS;
+
+12. Export host text files
+
+SELECT CONCAT(domain,".",tld),INET_NTOA(nsip) FROM host INTO OUTFILE '/mnt/qd/host.txt';
+exit
+cd /mnt/qd;split -l $((`wc -l host.txt|cut -d" " -f1` / 4 +1)) host.txt
+
+==============================
+//miss.csv
+//SELECT CONCAT(host.domain,".",host.tld),INET_NTOA(nsip),ip FROM host LEFT JOIN result ON host.domain = result.domain AND host.tld = result.tld WHERE result.ip IS NULL INTO OUTFILE '/mnt/qd/miss.csv';
+//split -l $((`wc -l host.txt|cut -d" " -f1` / 4 +1)) miss.csv
+
+//cd /mnt/qd;rm xaa xab xac xad;split -l $((`wc -l miss2.csv|cut -d" " -f1` / 4 +1)) miss2.csv
+//SELECT CONCAT(domain,".",tld),INET_NTOA(nsip) FROM host LIMIT 0,2500000 INTO OUTFILE '/mnt/qd/host1.txt';SELECT CONCAT(domain,".",tld),INET_NTOA(nsip) FROM host LIMIT 2500000,2500000 INTO OUTFILE '/mnt/qd/host2.txt';SELECT CONCAT(domain,".",tld),INET_NTOA(nsip) FROM host LIMIT 5000000,2500000 INTO OUTFILE '/mnt/qd/host3.txt';SELECT CONCAT(domain,".",tld),INET_NTOA(nsip) FROM host LIMIT 7500000,2500000 INTO OUTFILE '/mnt/qd/host4.txt';
+
+13. Start listeners
+
+cd /mnt/qd/;s3get ripresults/qd.c qd.c;gcc -o qd qd.c;cd results;s3get ripresults/start.sh start.sh;s3get ripresults/listener.c listener.c;gcc -o listener listener.c 
+
+cd /mnt/qd/results;source start.sh;cd ..
+
+14. Start resolvers
+
+=======loki========
+./qd xaa 127.0.0.1 `/sbin/ifconfig eth0|egrep -m1 -o "inet addr:[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}"|cut -d: -f2` 200 1 > out1.txt &
+./qd xab 127.0.0.1 `/sbin/ifconfig eth0|egrep -m1 -o "inet addr:[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}"|cut -d: -f2` 200 1 > out2.txt &
+./qd xac 127.0.0.1 `/sbin/ifconfig eth0|egrep -m1 -o "inet addr:[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}"|cut -d: -f2` 200 1 > out3.txt &
+./qd xad 127.0.0.1 `/sbin/ifconfig eth0|egrep -m1 -o "inet addr:[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}"|cut -d: -f2` 200 1 > out4.txt &
+===================
+
+3 times
+./qd xaa 172.16.0.23 `/sbin/ifconfig eth0|egrep -m1 -o "inet addr:[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}"|cut -d: -f2` 200 2 > out1.txt &
+./qd xab 172.16.0.23 `/sbin/ifconfig eth0|egrep -m1 -o "inet addr:[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}"|cut -d: -f2` 200 2 > out2.txt &
+./qd xac 172.16.0.23 `/sbin/ifconfig eth0|egrep -m1 -o "inet addr:[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}"|cut -d: -f2` 200 2 > out3.txt &
+./qd xad 172.16.0.23 `/sbin/ifconfig eth0|egrep -m1 -o "inet addr:[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}"|cut -d: -f2` 200 2 > out4.txt &
+
+3 times
+cd /mnt/qd/;s3get ripresults/qd-ns.c qd-ns.c;gcc -o qd-ns qd-ns.c
+./qd-ns xaa 172.16.0.23 `/sbin/ifconfig eth0|egrep -m1 -o "inet addr:[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}"|cut -d: -f2` 200 1 > out1.txt &
+./qd-ns xab 172.16.0.23 `/sbin/ifconfig eth0|egrep -m1 -o "inet addr:[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}"|cut -d: -f2` 200 1 > out2.txt &
+./qd-ns xac 172.16.0.23 `/sbin/ifconfig eth0|egrep -m1 -o "inet addr:[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}"|cut -d: -f2` 200 1 > out3.txt &
+./qd-ns xad 172.16.0.23 `/sbin/ifconfig eth0|egrep -m1 -o "inet addr:[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}"|cut -d: -f2` 200 1 > out4.txt &
+
+2 times
+cd /mnt/qd/;s3get ripresults/qd-sub.c qd-sub.c;gcc -o qd-sub qd-sub.c
+./qd-sub xaa 172.16.0.23 `/sbin/ifconfig eth0|egrep -m1 -o "inet addr:[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}"|cut -d: -f2` 200 1 > out1.txt &
+./qd-sub xab 172.16.0.23 `/sbin/ifconfig eth0|egrep -m1 -o "inet addr:[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}"|cut -d: -f2` 200 1 > out2.txt &
+./qd-sub xac 172.16.0.23 `/sbin/ifconfig eth0|egrep -m1 -o "inet addr:[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}"|cut -d: -f2` 200 1 > out3.txt &
+./qd-sub xad 172.16.0.23 `/sbin/ifconfig eth0|egrep -m1 -o "inet addr:[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}"|cut -d: -f2` 200 1 > out4.txt &
+
+
+15. Insert to DB
+
+cd /mnt/qd/results;cat results5* > bigresult1;mysql -u root -ptest
+
+USE revip;
+CREATE TABLE `result` (
+  `id` INT UNSIGNED NOT NULL auto_increment,
+  `subdomain` VARCHAR(4) default NULL,
+  `domain` VARCHAR(64) default NULL,
+  `tld` VARCHAR(4) default NULL,
+  `ip` INT UNSIGNED default NULL,
+  PRIMARY KEY  (`id`),
+  KEY `domain`(`domain`),
+  KEY `tld` (`tld`),
+  KEY `ip` (`ip`)
+) ENGINE=MyISAM AUTO_INCREMENT=1 DEFAULT CHARSET=latin1;
+
+USE revip;
+ALTER TABLE result DISABLE KEYS;
+LOAD DATA INFILE '/mnt/qd/results/bigresult1' INTO TABLE result FIELDS TERMINATED BY '.' (domain,tld,ip);
+ALTER TABLE result ENABLE KEYS;
+
+=======FOR WWW=========
+USE revip;
+ALTER TABLE result DISABLE KEYS;
+LOAD DATA INFILE '/mnt/qd/results/bigresult1' INTO TABLE result FIELDS TERMINATED BY '.' (subdomain,domain,tld,ip);
+ALTER TABLE result ENABLE KEYS;
+=======================
+
+
+16. kill listeners
+
+exit
+cd /mnt/qd/results;killall listener;rm results5*;rm delete5*;cd /mnt/qd;rm host.txt;mysql -u root -ptest
+
+=============================STATS AND REMOVE TRAILING CHARS FROM TLD=======================
+
+use revip;
+update result set tld = 'com' where tld like 'com%' and tld != 'com';
+update result set tld = 'net' where tld like 'net%' and tld != 'net';
+update result set tld = 'org' where tld like 'org%' and tld != 'org';
+update result set tld = 'info' where tld like 'info%' and tld != 'info';
+update result set tld = 'us' where tld like 'us%' and tld != 'us';
+update result set tld = 'biz' where tld like 'biz%' and tld != 'biz';
+update result set tld = 'ru' where tld like 'ru%' and tld != 'ru';
+select count(distinct(concat(domain,tld))) from result where tld = 'com';
+select count(distinct(concat(domain,tld))) from result where tld = 'net';
+select count(distinct(concat(domain,tld))) from result where tld = 'prg';
+select count(distinct(concat(domain,tld))) from result where tld = 'info';
+select count(distinct(concat(domain,tld))) from result where tld = 'us';
+select count(distinct(concat(domain,tld))) from result where tld = 'biz';
+select count(distinct(concat(domain,tld))) from result where tld = 'ru';
+
+17. Get missing
+
+use revip;
+SELECT CONCAT(host.domain,".",host.tld),INET_NTOA(nsip) FROM host LEFT JOIN result ON host.domain = result.domain AND host.tld = result.tld WHERE result.ip IS NULL INTO OUTFILE '/mnt/qd/host.txt';
+exit
+cd /mnt/qd;rm xaa xab xac xad;split -l $((`wc -l host.txt|cut -d" " -f1` / 4 +1)) host.txt
+
+
+exit
+cd /mnt/qd;rm missing*
+===OPTIONAL===
+mysql -u root -ptest
+use revip;
+select host.domain,host.tld,host.nsip from host LEFT JOIN result ON host.domain = result.domain AND host.tld = result.tld WHERE result.ip IS NULL INTO OUTFILE '/mnt/qd/missing.txt';
+
+
+rename table host to host_orig;
+use revip;
+CREATE TABLE `host` (
+  `id` INT UNSIGNED NOT NULL auto_increment,
+  `domain` VARCHAR(64) default NULL,
+  `tld` VARCHAR(4) default NULL,
+  `nsip` BIGINT default NULL,
+  PRIMARY KEY  (`id`),
+  KEY `domain` (`domain`),
+  KEY `tld` (`tld`)
+) ENGINE=MyISAM AUTO_INCREMENT=1 DEFAULT CHARSET=latin1;
+ALTER TABLE host DISABLE KEYS;
+LOAD DATA INFILE '/mnt/qd/missing.txt' INTO TABLE host(domain,tld,nsip);
+ALTER TABLE host ENABLE KEYS;
+===OPTIONAL===
+
+18. Goto step 13
+
+==============================================================
+19. Upload results
+exit
+echo "SELECT CONCAT(domain,\".\",tld,\".\",ip) FROM result INTO OUTFILE '/mnt/qd/results.$MACHINE.txt';" > out.sql;mysql -u root -ptest -D revip < out.sql
+
+cd /mnt/qd/;gzip results.$MACHINE.txt;s3put ripresults/results.$MACHINE.txt.gz results.$MACHINE.txt.gz 
+
+
+cd /mnt/qd/;mv missing.txt missing.$MACHINE.txt;gzip missing.$MACHINE.txt;s3put ripresults/missing.$MACHINE.txt.gz missing.$MACHINE.txt.gz;gzip results.$MACHINE.txt;s3put ripresults/results.$MACHINE.txt.gz results.$MACHINE.txt.gz 
+
+=====SINGLE MACHINE=====
+for i in `seq 2 10`;do s3get ripresults/results.machine$i.txt.gz results.machine$i.txt.gz;done
+
+gunzip *.gz;mysql -u root -ptest
+
+
+ALTER TABLE result DISABLE KEYS;
+LOAD DATA INFILE '/mnt/qd/results.machine1.txt' INTO TABLE result FIELDS TERMINATED BY '.' (domain,tld,ip);
+LOAD DATA INFILE '/mnt/qd/results.machine2.txt' INTO TABLE result FIELDS TERMINATED BY '.' (domain,tld,ip);
+LOAD DATA INFILE '/mnt/qd/results.machine3.txt' INTO TABLE result FIELDS TERMINATED BY '.' (domain,tld,ip);
+LOAD DATA INFILE '/mnt/qd/results.machine4.txt' INTO TABLE result FIELDS TERMINATED BY '.' (domain,tld,ip);
+LOAD DATA INFILE '/mnt/qd/results.machine5.txt' INTO TABLE result FIELDS TERMINATED BY '.' (domain,tld,ip);
+LOAD DATA INFILE '/mnt/qd/results.machine6.txt' INTO TABLE result FIELDS TERMINATED BY '.' (domain,tld,ip);
+LOAD DATA INFILE '/mnt/qd/results.machine7.txt' INTO TABLE result FIELDS TERMINATED BY '.' (domain,tld,ip);
+LOAD DATA INFILE '/mnt/qd/results.machine8.txt' INTO TABLE result FIELDS TERMINATED BY '.' (domain,tld,ip);
+LOAD DATA INFILE '/mnt/qd/results.machine9.txt' INTO TABLE result FIELDS TERMINATED BY '.' (domain,tld,ip);
+LOAD DATA INFILE '/mnt/qd/results.machine10.txt' INTO TABLE result FIELDS TERMINATED BY '.' (domain,tld,ip);
+ALTER TABLE result ENABLE KEYS;
+
+SELECT domain,tld,ip FROM result INTO OUTFILE '/mnt/revip/results.txt';
+
+======
+USE revip;
+CREATE TABLE `result` (
+  `id` INT UNSIGNED NOT NULL auto_increment,
+  `subdomain` VARCHAR(4) default NULL,
+  `domain` VARCHAR(64) default NULL,
+  `tld` VARCHAR(4) default NULL,
+  `ip` INT UNSIGNED default NULL,
+  PRIMARY KEY  (`id`),
+  KEY `domain`(`domain`),
+  KEY `tld` (`tld`),
+  KEY `ip` (`ip`)
+) ENGINE=MyISAM AUTO_INCREMENT=1 DEFAULT CHARSET=latin1;
+
+
+
+insert into result(domain,tld,ip) values ('jackh4x0r','zzz',inet_aton('5.5.5.5'));
+
+
+
+
+
